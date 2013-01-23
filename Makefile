@@ -8,3 +8,6 @@ ppx_driver.opt.exe: ppx_driver.ml
 
 clean:
 	rm -f *~ *.cm* *.exe *.o *.obj *.a *.lib
+
+test:
+	ocamlfind ocamlc -package sedlex -c -ppx "./ppx_driver.exe -v -I `ocamlfind query sedlex`" test_sedlex.ml
