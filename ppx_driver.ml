@@ -1,14 +1,6 @@
-(***********************************************************************)
-(*                                                                     *)
-(*                                OCaml                                *)
-(*                                                                     *)
-(*                        Alain Frisch, LexiFi                         *)
-(*                                                                     *)
-(*  Copyright 2012 Institut National de Recherche en Informatique et   *)
-(*  en Automatique.  All rights reserved.  This file is distributed    *)
-(*  under the terms of the Q Public License version 1.0.               *)
-(*                                                                     *)
-(***********************************************************************)
+(* The package ppx_drivers is released under the terms of an MIT-like *)
+(* license. See the attached LICENSE file.                            *)
+(* Copyright 2013 by Alain Frisch and LexiFi.                         *)
 
 (* A basic ppx driver, which dynlinks AST rewriters specified on its
    command-line and run all of them.  All command-line arguments
@@ -18,7 +10,15 @@
    once.  All other arguments on the command-line are passed to the
    preceeding plugin.  *)
 
+open Location
+open Longident
+open Parsetree
+
+
 let current = ref None
+let mappers = ref []
+let load_dirs = ref ["."]
+let verbose = ref false
 
 let () =
   at_exit
@@ -43,48 +43,84 @@ let is_plugin s =
   Filename.check_suffix s ".cma" ||
   Filename.check_suffix s ".cmxs"
 
+
+let load_plugin cmd args =
+  let cmd = Dynlink.adapt_filename cmd in
+  Ast_mapper.register_function :=
+    (fun name f ->
+      run_sub cmd name
+        (fun () ->
+          if !verbose then
+            Printf.printf "Plugin %s registers rewriter '%s'\n%!" cmd name;
+          mappers := (cmd, name, f args) :: !mappers)
+    );
+  if !verbose then Printf.printf "Looking for plugin %s ...\n%!" cmd;
+  let dir =
+    try List.find (fun d -> Sys.file_exists (Filename.concat d cmd)) !load_dirs
+    with Not_found ->
+      Printf.eprintf "Cannot locate file %s\n%!" cmd;
+      exit 2
+  in
+  if !verbose then Printf.printf "... found in %s\n%!" dir;
+  try Dynlink.loadfile (Filename.concat dir cmd)
+  with exn ->
+    Printf.eprintf "Error while loading %s:\n%s\n%!" cmd (Printexc.to_string exn);
+    exit 2
+
 let rec parse_cmdline = function
-  | [] -> []
+  | [] -> ()
+  | "-v" :: rest -> verbose := true; parse_cmdline rest
+  | "-I" :: dir :: rest -> load_dirs := dir :: !load_dirs; parse_cmdline rest
   | cmd :: rest when is_plugin cmd ->
-      let cmd = Dynlink.adapt_filename cmd in
       let rec parse_args args = function
         | arg :: rest when not (is_plugin arg) ->
             parse_args (arg :: args) rest
         | rest ->
-            (cmd, List.rev args) :: parse_cmdline rest
+            load_plugin cmd (List.rev args);
+            parse_cmdline rest
       in
       parse_args [] rest
   | arg :: _ ->
       Printf.eprintf "Don't know what to do with command-line argument '%s'.\n%!" arg;
       exit 2
 
-let load_plugin mappers (cmd, args) =
-  Ast_mapper.register_function :=
-    (fun name f ->
-      run_sub cmd name
-        (fun () -> mappers := (cmd, name, f args) :: !mappers)
-    );
-  try
-    Dynlink.loadfile cmd
-  with exn ->
-    Printf.eprintf "Error while loading %s:\n%s\n" cmd (Printexc.to_string exn);
-    exit 2
 
 let main args =
-  let mappers = ref [] in
-  List.iter (load_plugin mappers) (parse_cmdline args);
-  let mappers = List.rev !mappers in
-  let apply_all r f s =
+  parse_cmdline args;
+  let load = function
+    | cmd :: args when is_plugin cmd -> load_plugin cmd args
+    | l ->
+        Printf.eprintf "Cannot parse load_ppx directive %s\n%!" (String.concat "," l)
+  in
+  let apply_all parse_directive run f s =
+    let s =
+      List.fold_left
+        (fun acc x ->
+          match parse_directive x with
+          | None -> x :: acc
+          | Some args -> load args; acc
+        )
+        [] s
+    in
     List.fold_left
       (fun (f, s) (cmd, name, mapper) ->
-        run_sub cmd name (fun () -> r mapper f s)
+        if !verbose then Printf.printf "Running rewriter '%s' registered by %s\n%!" name cmd;
+        run_sub cmd name (fun () -> run mapper f s)
       )
-      (f, s)
-      mappers
+      (f, List.rev s)
+      (List.rev !mappers)
+  in
+  let parse_ml = function
+    | {pstr_desc=Pstr_primitive ({txt="load_ppx"}, {pval_prim=l})} -> Some l
+    | _ -> None
+  in
+  let parse_mli = function
+    | {psig_desc=Psig_value ({txt="load_ppx"}, {pval_prim=l})} when l <> [] -> Some l
+    | _ -> None
   in
   object
-    method implementation = apply_all (fun m -> m # implementation)
-    method interface = apply_all (fun m -> m # interface)
+    method implementation = apply_all parse_ml (fun m -> m # implementation)
+    method interface = apply_all parse_mli (fun m -> m # interface)
   end
 
 let () =
