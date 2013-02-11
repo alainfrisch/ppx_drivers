@@ -43,29 +43,44 @@ let is_plugin s =
   Filename.check_suffix s ".cma" ||
   Filename.check_suffix s ".cmxs"
 
+let plugins = Hashtbl.create 8
+
 
 let load_plugin cmd args =
   let cmd = Dynlink.adapt_filename cmd in
-  Ast_mapper.register_function :=
-    (fun name f ->
-      run_sub cmd name
-        (fun () ->
-          if !verbose then
-            Printf.printf "Plugin %s registers rewriter '%s'\n%!" cmd name;
-          mappers := (cmd, name, f args) :: !mappers)
-    );
-  if !verbose then Printf.printf "Looking for plugin %s ...\n%!" cmd;
-  let dir =
-    try List.find (fun d -> Sys.file_exists (Filename.concat d cmd)) !load_dirs
+  let  l =
+    try Hashtbl.find plugins cmd
     with Not_found ->
-      Printf.eprintf "Cannot locate file %s\n%!" cmd;
-      exit 2
+      if !verbose then Printf.printf "ppx_driver: looking for plugin %s ...\n%!" cmd;
+      let dir =
+        try List.find (fun d -> Sys.file_exists (Filename.concat d cmd)) !load_dirs
+        with Not_found ->
+          Printf.eprintf "ppx_driver: cannot locate file %s\n%!" cmd;
+          exit 2
+      in
+      if !verbose then Printf.printf "ppx_driver: ... found in %s\n%!" dir;
+      let l = ref [] in
+      Ast_mapper.register_function :=
+        (fun name f ->
+          if !verbose then
+            Printf.printf "ppx_driver: plugin %s registers rewriter '%s'\n%!" cmd name;
+          l := (name, f) :: !l
+        );
+      begin try Dynlink.loadfile (Filename.concat dir cmd);
+      with exn ->
+        Printf.eprintf "ppx_driver: error while loading %s:\n%s\n%!" cmd (Printexc.to_string exn);
+        exit 2
+      end;
+      let l = List.rev !l in
+      Hashtbl.add plugins cmd l;
+      l
   in
-  if !verbose then Printf.printf "... found in %s\n%!" dir;
-  try Dynlink.loadfile (Filename.concat dir cmd)
-  with exn ->
-    Printf.eprintf "Error while loading %s:\n%s\n%!" cmd (Printexc.to_string exn);
-    exit 2
+  List.iter
+    (fun (name, f) ->
+      run_sub cmd name
+        (fun () -> mappers := (cmd, name, f args) :: !mappers)
+    )
+    l
 
 let rec parse_cmdline = function
   | [] -> ()
@@ -81,7 +96,7 @@ let rec parse_cmdline = function
       in
       parse_args [] rest
   | arg :: _ ->
-      Printf.eprintf "Don't know what to do with command-line argument '%s'.\n%!" arg;
+      Printf.eprintf "ppx_driver: don't know what to do with command-line argument '%s'.\n%!" arg;
       exit 2
 
 
@@ -90,7 +105,7 @@ let main args =
   let load = function
     | cmd :: args when is_plugin cmd -> load_plugin cmd args
     | l ->
-        Printf.eprintf "Cannot parse load_ppx directive %s\n%!" (String.concat "," l)
+        Printf.eprintf "ppx_driver: cannot parse load_ppx directive %s\n%!" (String.concat "," l)
   in
   let apply_all parse_directive run f s =
     let s =
@@ -104,7 +119,7 @@ let main args =
     in
     List.fold_left
       (fun (f, s) (cmd, name, mapper) ->
-        if !verbose then Printf.printf "Running rewriter '%s' registered by %s\n%!" name cmd;
+        if !verbose then Printf.printf "ppx_driver: running rewriter '%s' registered by %s\n%!" name cmd;
         run_sub cmd name (fun () -> run mapper f s)
       )
       (f, List.rev s)
